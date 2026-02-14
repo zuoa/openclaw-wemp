@@ -28,11 +28,21 @@ openclaw plugins info wechat-mp
 openclaw plugins doctor
 ```
 
-5. 在 `~/.openclaw/openclaw.json` 配置 `channels.wemp`
+5. 配置渠道（推荐走向导）
 
-- 下面的 `OpenClaw 配置示例（JSON）` 可直接参考。`channels.wemp` 这种对象结构是正确的。
-- 支持 `openclaw configure --section channels` 交互配置 `wemp`（推荐）。
-- 也可以手工写入 `channels.wemp`（功能等价）。
+```bash
+openclaw configure --section channels
+```
+
+或：
+
+```bash
+openclaw channels add
+```
+
+- `openclaw channels add`（无参数）会进入交互式向导。
+- `openclaw channels add --channel wemp` 是非交互模式，需要同时传完整凭证参数，否则会报 `missing appId/appSecret/token`。
+- 也可以手工写入 `~/.openclaw/openclaw.json` 的 `channels.wemp`。
 
 
 ## 功能

@@ -59,9 +59,21 @@ function normalizeWebhookPath(value) {
 
 function parseXml(xml) {
   const pick = (tag) => {
-    const re = new RegExp(`<${tag}><!\\[CDATA\\[(.*?)]]><\\/${tag}>|<${tag}>(.*?)<\\/${tag}>`, "s");
-    const m = xml.match(re);
-    return (m?.[1] ?? m?.[2] ?? "").trim();
+    const open = `<${tag}>`;
+    const close = `</${tag}>`;
+    const start = xml.indexOf(open);
+    if (start < 0) return "";
+    const bodyStart = start + open.length;
+    const end = xml.indexOf(close, bodyStart);
+    if (end < 0) return "";
+
+    let value = xml.slice(bodyStart, end);
+    if (value.startsWith("<![CDATA[") && value.endsWith("]]>")) {
+      const cdataPrefix = "<![CDATA[";
+      const cdataSuffix = "]]>";
+      value = value.slice(cdataPrefix.length, -cdataSuffix.length);
+    }
+    return value.trim();
   };
 
   return {
@@ -102,6 +114,77 @@ function parseUrlQuery(urlText) {
       return {};
     }
   }
+}
+
+function parseUnknownQuery(value) {
+  if (value == null) return {};
+  if (value instanceof URL) {
+    return Object.fromEntries(value.searchParams.entries());
+  }
+  if (value instanceof URLSearchParams) {
+    return Object.fromEntries(value.entries());
+  }
+  if (typeof value === "string") {
+    return parseUrlQuery(value);
+  }
+  if (typeof value !== "object") return {};
+
+  const fromSearchParams = value.searchParams;
+  if (fromSearchParams instanceof URLSearchParams) {
+    return Object.fromEntries(fromSearchParams.entries());
+  }
+  if (fromSearchParams instanceof URL) {
+    return Object.fromEntries(fromSearchParams.searchParams.entries());
+  }
+  if (typeof fromSearchParams === "string") {
+    const parsed = parseUrlQuery(fromSearchParams);
+    if (Object.keys(parsed).length > 0) return parsed;
+  }
+  if (typeof value.url === "string") {
+    const parsed = parseUrlQuery(value.url);
+    if (Object.keys(parsed).length > 0) return parsed;
+  }
+  if (value.url instanceof URL) {
+    return Object.fromEntries(value.url.searchParams.entries());
+  }
+  if (typeof value.nextUrl === "string") {
+    const parsed = parseUrlQuery(value.nextUrl);
+    if (Object.keys(parsed).length > 0) return parsed;
+  }
+  if (value.nextUrl instanceof URL) {
+    return Object.fromEntries(value.nextUrl.searchParams.entries());
+  }
+  if (value.nextUrl?.searchParams instanceof URLSearchParams) {
+    return Object.fromEntries(value.nextUrl.searchParams.entries());
+  }
+
+  const proto = Object.getPrototypeOf(value);
+  const isPlainObject = proto === Object.prototype || proto === null;
+  if (!isPlainObject) return {};
+  const entries = Object.entries(value).filter(([, v]) => v != null);
+  if (entries.length === 0) return {};
+  return Object.fromEntries(entries.map(([k, v]) => [k, toStringValue(v)]));
+}
+
+function readQueryFromRequest(req) {
+  if (!req || typeof req !== "object") return {};
+
+  const candidates = [
+    req.query,
+    req.searchParams,
+    req.nextUrl?.searchParams,
+    req.nextUrl,
+    req.url,
+    req.originalUrl,
+    req.href,
+    req.request?.url
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = parseUnknownQuery(candidate);
+    if (Object.keys(parsed).length > 0) return parsed;
+  }
+  return {};
 }
 
 function normalizeAccountConfig(raw) {
@@ -337,7 +420,7 @@ function buildSetupMissingFieldsMessage(values) {
   if (!values.appSecret) missing.push("appSecret");
   if (!values.token) missing.push("token");
   if (missing.length === 0) return null;
-  return `wemp missing ${missing.join("/")}. Use configure wizard, or pass --bot-token <appId> --app-token <appSecret> --token <wechatToken>.`;
+  return `wemp missing ${missing.join("/")}. Use interactive setup with 'openclaw channels add' (no flags) or 'openclaw configure --section channels', or pass --bot-token <appId> --app-token <appSecret> --token <wechatToken>.`;
 }
 
 function buildOnboardingStatus(rootCfg) {
@@ -608,7 +691,7 @@ function createChannelPlugin(api) {
   const createWebhookHandler = ({ cfg, account, log }) => {
     return async (req, res) => {
       const method = toStringValue(req?.method, "GET").toUpperCase();
-      const query = parseUrlQuery(req?.url);
+      const query = readQueryFromRequest(req);
       const signature = toStringValue(query.signature).trim();
       const timestamp = toStringValue(query.timestamp).trim();
       const nonce = toStringValue(query.nonce).trim();
