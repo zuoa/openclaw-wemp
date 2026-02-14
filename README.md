@@ -28,13 +28,7 @@ openclaw plugins info wemp
 openclaw plugins doctor
 ```
 
-5. 配置渠道（推荐走向导）
-
-```bash
-openclaw configure --section channels
-```
-
-或：
+5. 配置渠道（推荐）
 
 ```bash
 openclaw channels add
@@ -43,6 +37,10 @@ openclaw channels add
 - `openclaw channels add`（无参数）会进入交互式向导。
 - `openclaw channels add --channel wemp` 是非交互模式，需要同时传完整凭证参数，否则会报 `missing appId/appSecret/token`。
 - 也可以手工写入 `~/.openclaw/openclaw.json` 的 `channels.wemp`。
+
+已知限制（OpenClaw 2026.2.13 / 203b5bd）：
+- `openclaw configure --section channels` 里可能看不到第三方 path 插件渠道（包括 `wemp`）。
+- 这种情况下请使用 `openclaw channels add` 完成配置。
 
 
 ## 功能
