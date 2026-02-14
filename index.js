@@ -775,8 +775,10 @@ function createChannelPlugin(api) {
       label: "wemp (WeChat Official Account)",
       selectionLabel: "wemp (WeChat Official Account Webhook)",
       docsPath: "/channels/wemp",
+      docsLabel: "wemp",
       blurb: "WeChat Official Account webhook channel for OpenClaw.",
-      aliases: ["wechat", "wemp"]
+      aliases: ["wechat", "wemp", "weixin", "公众号", "微信"],
+      order: 1
     },
     capabilities: {
       chatTypes: ["direct"],

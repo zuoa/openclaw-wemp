@@ -27,12 +27,18 @@
       "id": "wemp",
       "label": "wemp (WeChat Official Account)",
       "selectionLabel": "wemp (WeChat Official Account Webhook)",
+      "detailLabel": "wemp",
       "docsPath": "/channels/wemp",
+      "docsLabel": "wemp",
       "blurb": "Connect WeChat Official Account webhook messages to OpenClaw Gateway.",
       "aliases": [
         "wechat",
-        "wemp"
-      ]
+        "wemp",
+        "weixin",
+        "公众号",
+        "微信"
+      ],
+      "order": 1
     },
     "install": {
       "npmSpec": "git+https://github.com/zuoa/openclaw-wemp.git",
