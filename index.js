@@ -4,6 +4,7 @@ import {
   emptyPluginConfigSchema,
   isRequestBodyLimitError,
   normalizePluginHttpPath,
+  promptAccountId,
   readRequestBodyWithLimit,
   registerPluginHttpRoute,
   requestBodyErrorToText
@@ -15,6 +16,10 @@ const DEFAULT_ACCOUNT_ID = "default";
 const DEFAULT_WEBHOOK_PATH = "/wemp";
 const WEBHOOK_MAX_BODY_BYTES = 1024 * 1024;
 const WEBHOOK_BODY_TIMEOUT_MS = 30_000;
+const VALID_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+const INVALID_CHARS_RE = /[^a-z0-9_-]+/g;
+const LEADING_DASH_RE = /^-+/;
+const TRAILING_DASH_RE = /-+$/;
 
 function toStringValue(value, fallback = "") {
   if (typeof value === "string") return value;
@@ -29,6 +34,27 @@ function nowMessageId(prefix = "wemp") {
 function toSafeErrorText(err) {
   if (err instanceof Error) return err.message;
   return toStringValue(err, "unknown error");
+}
+
+function normalizeAccountIdValue(value) {
+  const trimmed = toStringValue(value).trim();
+  if (!trimmed) return DEFAULT_ACCOUNT_ID;
+  if (VALID_ID_RE.test(trimmed)) return trimmed.toLowerCase();
+  return (
+    trimmed
+      .toLowerCase()
+      .replace(INVALID_CHARS_RE, "-")
+      .replace(LEADING_DASH_RE, "")
+      .replace(TRAILING_DASH_RE, "")
+      .slice(0, 64) || DEFAULT_ACCOUNT_ID
+  );
+}
+
+function normalizeWebhookPath(value) {
+  const path = toStringValue(value).trim();
+  if (!path) return DEFAULT_WEBHOOK_PATH;
+  if (path.startsWith("/")) return path;
+  return `/${path}`;
 }
 
 function parseXml(xml) {
@@ -233,6 +259,102 @@ function deleteAccountFromConfig(rootCfg, accountId) {
         accounts: nextAccounts
       }
     }
+  };
+}
+
+function upsertAccountConfig(rootCfg, accountId, patch) {
+  const cfg = rootCfg && typeof rootCfg === "object" ? rootCfg : {};
+  const channels = cfg.channels && typeof cfg.channels === "object" ? cfg.channels : {};
+  const channelCfg = pickChannelConfig(cfg);
+  const normalizedId = normalizeAccountIdValue(accountId);
+  const accounts = accountMapFromChannelConfig(channelCfg);
+
+  if (!accounts && normalizedId === DEFAULT_ACCOUNT_ID) {
+    return {
+      ...cfg,
+      channels: {
+        ...channels,
+        [CHANNEL_ID]: {
+          ...channelCfg,
+          ...patch
+        }
+      }
+    };
+  }
+
+  const nextAccounts = { ...(accounts || {}) };
+  const currentEntry =
+    nextAccounts[normalizedId] && typeof nextAccounts[normalizedId] === "object"
+      ? nextAccounts[normalizedId]
+      : {};
+  nextAccounts[normalizedId] = {
+    ...currentEntry,
+    ...patch
+  };
+
+  return {
+    ...cfg,
+    channels: {
+      ...channels,
+      [CHANNEL_ID]: {
+        ...channelCfg,
+        accounts: nextAccounts
+      }
+    }
+  };
+}
+
+function pickSetupCredentials(input, existingAccount) {
+  const appId = toStringValue(input?.botToken ?? input?.userId ?? existingAccount?.appId).trim();
+  const appSecret = toStringValue(input?.appToken ?? input?.password ?? existingAccount?.appSecret).trim();
+  const token = toStringValue(input?.token ?? existingAccount?.token).trim();
+
+  let webhookPath = toStringValue(input?.webhookPath ?? existingAccount?.webhookPath).trim();
+  if (!webhookPath) {
+    const webhookUrl = toStringValue(input?.webhookUrl).trim();
+    if (webhookUrl) {
+      try {
+        webhookPath = new URL(webhookUrl).pathname || DEFAULT_WEBHOOK_PATH;
+      } catch {
+        webhookPath = webhookUrl;
+      }
+    }
+  }
+
+  return {
+    appId,
+    appSecret,
+    token,
+    webhookPath: normalizeWebhookPath(webhookPath),
+    name: toStringValue(input?.name ?? existingAccount?.name).trim(),
+    enabled: true
+  };
+}
+
+function buildSetupMissingFieldsMessage(values) {
+  const missing = [];
+  if (!values.appId) missing.push("appId");
+  if (!values.appSecret) missing.push("appSecret");
+  if (!values.token) missing.push("token");
+  if (missing.length === 0) return null;
+  return `wemp missing ${missing.join("/")}. Use configure wizard, or pass --bot-token <appId> --app-token <appSecret> --token <wechatToken>.`;
+}
+
+function buildOnboardingStatus(rootCfg) {
+  const accountIds = listAccountIdsFromRootConfig(rootCfg);
+  const configuredCount = accountIds.filter((id) =>
+    isAccountConfigured(resolveAccountFromRootConfig(rootCfg, id))
+  ).length;
+  const configured = configuredCount > 0;
+  return {
+    configured,
+    statusLines: [
+      configured
+        ? `WeChat Official Account: configured (${configuredCount}/${accountIds.length} account${configuredCount > 1 ? "s" : ""})`
+        : "WeChat Official Account: needs appId + appSecret + token"
+    ],
+    selectionHint: configured ? "configured" : "needs credentials",
+    quickstartScore: configured ? 2 : 1
   };
 }
 
@@ -602,6 +724,120 @@ function createChannelPlugin(api) {
         webhookPath: account.webhookPath,
         mode: "webhook"
       })
+    },
+    setup: {
+      resolveAccountId: ({ accountId }) => normalizeAccountIdValue(accountId),
+      applyAccountName: ({ cfg, accountId, name }) =>
+        upsertAccountConfig(cfg, accountId, { name: toStringValue(name).trim() }),
+      validateInput: ({ cfg, accountId, input }) => {
+        const existing = resolveAccountFromRootConfig(cfg, accountId);
+        const values = pickSetupCredentials(input, existing);
+        return buildSetupMissingFieldsMessage(values);
+      },
+      applyAccountConfig: ({ cfg, accountId, input }) => {
+        const existing = resolveAccountFromRootConfig(cfg, accountId);
+        const values = pickSetupCredentials(input, existing);
+        const patch = {
+          enabled: true,
+          appId: values.appId,
+          appSecret: values.appSecret,
+          token: values.token,
+          webhookPath: values.webhookPath,
+          verifySignature: existing.verifySignature !== false
+        };
+        if (values.name) patch.name = values.name;
+        return upsertAccountConfig(cfg, accountId, patch);
+      }
+    },
+    onboarding: {
+      channel: CHANNEL_ID,
+      getStatus: async ({ cfg }) => ({
+        channel: CHANNEL_ID,
+        ...buildOnboardingStatus(cfg)
+      }),
+      configure: async ({ cfg, prompter, accountOverrides, shouldPromptAccountIds }) => {
+        const overrideId = toStringValue(accountOverrides?.[CHANNEL_ID]).trim();
+        const defaultAccountId = defaultAccountIdFromChannelConfig(pickChannelConfig(cfg));
+        let accountId = overrideId ? normalizeAccountIdValue(overrideId) : defaultAccountId;
+
+        if (shouldPromptAccountIds) {
+          accountId = await promptAccountId({
+            cfg,
+            prompter,
+            label: "WeChat",
+            currentId: accountId,
+            listAccountIds: listAccountIdsFromRootConfig,
+            defaultAccountId
+          });
+        }
+
+        accountId = normalizeAccountIdValue(accountId);
+        const existing = resolveAccountFromRootConfig(cfg, accountId);
+
+        await prompter.note(
+          [
+            "Configure WeChat Official Account webhook credentials.",
+            "You can update these later with `openclaw configure --section channels`.",
+            "AppID / AppSecret come from 微信公众号后台 -> 开发 -> 基本配置。"
+          ].join("\n"),
+          "WeChat setup"
+        );
+
+        const nameInput = await prompter.text({
+          message: "Account display name (optional)",
+          initialValue: existing.name || accountId
+        });
+        const appIdInput = await prompter.text({
+          message: "WeChat AppID",
+          initialValue: existing.appId,
+          validate: (value) => (toStringValue(value).trim() ? undefined : "Required")
+        });
+        const appSecretInput = await prompter.text({
+          message: "WeChat AppSecret",
+          initialValue: existing.appSecret,
+          validate: (value) => (toStringValue(value).trim() ? undefined : "Required")
+        });
+        const tokenInput = await prompter.text({
+          message: "Webhook Token (must match WeChat backend)",
+          initialValue: existing.token,
+          validate: (value) => (toStringValue(value).trim() ? undefined : "Required")
+        });
+        const webhookPathInput = await prompter.text({
+          message: "Webhook path",
+          initialValue: existing.webhookPath || DEFAULT_WEBHOOK_PATH,
+          validate: (value) => (toStringValue(value).trim() ? undefined : "Required")
+        });
+        const verifySignature = await prompter.confirm({
+          message: "Enable webhook signature verification?",
+          initialValue: existing.verifySignature !== false
+        });
+
+        const next = upsertAccountConfig(cfg, accountId, {
+          enabled: true,
+          name: toStringValue(nameInput).trim() || accountId,
+          appId: toStringValue(appIdInput).trim(),
+          appSecret: toStringValue(appSecretInput).trim(),
+          token: toStringValue(tokenInput).trim(),
+          webhookPath: normalizeWebhookPath(webhookPathInput),
+          verifySignature
+        });
+
+        return { cfg: next, accountId };
+      },
+      disable: (cfg) => {
+        const channels = cfg?.channels && typeof cfg.channels === "object" ? cfg.channels : {};
+        const channelCfg = pickChannelConfig(cfg);
+        return {
+          ...cfg,
+          channels: {
+            ...channels,
+            [CHANNEL_ID]: {
+              ...channelCfg,
+              enabled: false
+            }
+          }
+        };
+      }
     },
     outbound: {
       deliveryMode: "direct",
