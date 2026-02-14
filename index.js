@@ -1,12 +1,34 @@
 import { createHash } from "node:crypto";
+import {
+  createReplyPrefixOptions,
+  emptyPluginConfigSchema,
+  isRequestBodyLimitError,
+  normalizePluginHttpPath,
+  readRequestBodyWithLimit,
+  registerPluginHttpRoute,
+  requestBodyErrorToText
+} from "openclaw/plugin-sdk";
 
+const PLUGIN_ID = "wechat-mp";
 const CHANNEL_ID = "wemp";
+const DEFAULT_ACCOUNT_ID = "default";
 const DEFAULT_WEBHOOK_PATH = "/wemp";
+const WEBHOOK_MAX_BODY_BYTES = 1024 * 1024;
+const WEBHOOK_BODY_TIMEOUT_MS = 30_000;
 
 function toStringValue(value, fallback = "") {
   if (typeof value === "string") return value;
   if (value == null) return fallback;
   return String(value);
+}
+
+function nowMessageId(prefix = "wemp") {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function toSafeErrorText(err) {
+  if (err instanceof Error) return err.message;
+  return toStringValue(err, "unknown error");
 }
 
 function parseXml(xml) {
@@ -15,6 +37,7 @@ function parseXml(xml) {
     const m = xml.match(re);
     return (m?.[1] ?? m?.[2] ?? "").trim();
   };
+
   return {
     toUserName: pick("ToUserName"),
     fromUserName: pick("FromUserName"),
@@ -32,44 +55,34 @@ function sha1(input) {
 }
 
 function verifySignature({ token, signature, timestamp, nonce }) {
+  if (!token || !signature || !timestamp || !nonce) return false;
   const source = [token, timestamp, nonce].sort().join("");
   return sha1(source) === signature;
 }
 
-function readQuery(input) {
-  if (!input) return {};
-  if (input instanceof URLSearchParams) {
-    return Object.fromEntries(input.entries());
+function parseUrlQuery(urlText) {
+  const source = toStringValue(urlText).trim();
+  if (!source) return {};
+  if (source.startsWith("?")) {
+    return Object.fromEntries(new URLSearchParams(source).entries());
   }
-  if (input instanceof URL) {
-    return Object.fromEntries(input.searchParams.entries());
-  }
-  if (typeof input === "string") {
-    const source = input.trim();
-    if (!source) return {};
-    if (source.startsWith("?")) {
-      return Object.fromEntries(new URLSearchParams(source).entries());
-    }
+
+  try {
+    return Object.fromEntries(new URL(source).searchParams.entries());
+  } catch {
     try {
-      return Object.fromEntries(new URL(source).searchParams.entries());
+      return Object.fromEntries(new URL(source, "http://localhost").searchParams.entries());
     } catch {
-      try {
-        return Object.fromEntries(new URL(source, "http://localhost").searchParams.entries());
-      } catch {
-        return {};
-      }
+      return {};
     }
   }
-  if (typeof input === "object") {
-    return input;
-  }
-  return {};
 }
 
-function normalizeConfig(raw) {
+function normalizeAccountConfig(raw) {
   const cfg = raw && typeof raw === "object" ? raw : {};
   return {
     enabled: cfg.enabled !== false,
+    name: toStringValue(cfg.name),
     appId: toStringValue(cfg.appId),
     appSecret: toStringValue(cfg.appSecret),
     token: toStringValue(cfg.token),
@@ -78,16 +91,165 @@ function normalizeConfig(raw) {
   };
 }
 
-async function fetchAccessToken(state, cfg) {
+function pickChannelConfig(rootCfg) {
+  const channels = rootCfg && typeof rootCfg === "object" ? rootCfg.channels : undefined;
+  const raw = channels && typeof channels === "object" ? channels[CHANNEL_ID] : undefined;
+  return raw && typeof raw === "object" ? raw : {};
+}
+
+function accountMapFromChannelConfig(channelCfg) {
+  const accounts = channelCfg.accounts;
+  if (!accounts || typeof accounts !== "object" || Array.isArray(accounts)) return null;
+  return accounts;
+}
+
+function defaultAccountIdFromChannelConfig(channelCfg) {
+  const accounts = accountMapFromChannelConfig(channelCfg);
+  if (!accounts) return DEFAULT_ACCOUNT_ID;
+  if (accounts[DEFAULT_ACCOUNT_ID]) return DEFAULT_ACCOUNT_ID;
+  const ids = Object.keys(accounts);
+  return ids[0] ?? DEFAULT_ACCOUNT_ID;
+}
+
+function mergeBaseAccountConfig(channelCfg, accountCfg) {
+  const base = { ...channelCfg };
+  delete base.accounts;
+  return { ...base, ...(accountCfg && typeof accountCfg === "object" ? accountCfg : {}) };
+}
+
+function listAccountIdsFromRootConfig(rootCfg) {
+  const channelCfg = pickChannelConfig(rootCfg);
+  const accounts = accountMapFromChannelConfig(channelCfg);
+  if (!accounts) return [DEFAULT_ACCOUNT_ID];
+
+  const ids = Object.keys(accounts);
+  if (ids.length === 0) return [DEFAULT_ACCOUNT_ID];
+  return ids;
+}
+
+function resolveAccountFromRootConfig(rootCfg, accountId) {
+  const channelCfg = pickChannelConfig(rootCfg);
+  const accounts = accountMapFromChannelConfig(channelCfg);
+
+  if (!accounts) {
+    const normalized = normalizeAccountConfig(channelCfg);
+    return {
+      ...normalized,
+      accountId: DEFAULT_ACCOUNT_ID,
+      name: normalized.name || "default"
+    };
+  }
+
+  const requestedId = toStringValue(accountId) || defaultAccountIdFromChannelConfig(channelCfg);
+  const resolvedId = accounts[requestedId]
+    ? requestedId
+    : accounts[DEFAULT_ACCOUNT_ID]
+      ? DEFAULT_ACCOUNT_ID
+      : defaultAccountIdFromChannelConfig(channelCfg);
+
+  const merged = mergeBaseAccountConfig(channelCfg, accounts[resolvedId]);
+  const normalized = normalizeAccountConfig(merged);
+
+  return {
+    ...normalized,
+    accountId: resolvedId,
+    name: normalized.name || resolvedId
+  };
+}
+
+function isAccountConfigured(account) {
+  return Boolean(account.appId && account.appSecret && account.token);
+}
+
+function setAccountEnabledInConfig(rootCfg, accountId, enabled) {
+  const cfg = rootCfg && typeof rootCfg === "object" ? rootCfg : {};
+  const channelCfg = pickChannelConfig(cfg);
+  const channels = cfg.channels && typeof cfg.channels === "object" ? cfg.channels : {};
+  const accounts = accountMapFromChannelConfig(channelCfg);
+
+  if (!accounts) {
+    return {
+      ...cfg,
+      channels: {
+        ...channels,
+        [CHANNEL_ID]: {
+          ...channelCfg,
+          enabled
+        }
+      }
+    };
+  }
+
+  const resolvedId = toStringValue(accountId) || defaultAccountIdFromChannelConfig(channelCfg);
+  return {
+    ...cfg,
+    channels: {
+      ...channels,
+      [CHANNEL_ID]: {
+        ...channelCfg,
+        accounts: {
+          ...accounts,
+          [resolvedId]: {
+            ...(accounts[resolvedId] && typeof accounts[resolvedId] === "object" ? accounts[resolvedId] : {}),
+            enabled
+          }
+        }
+      }
+    }
+  };
+}
+
+function deleteAccountFromConfig(rootCfg, accountId) {
+  const cfg = rootCfg && typeof rootCfg === "object" ? rootCfg : {};
+  const channelCfg = pickChannelConfig(cfg);
+  const channels = cfg.channels && typeof cfg.channels === "object" ? cfg.channels : {};
+  const accounts = accountMapFromChannelConfig(channelCfg);
+
+  if (!accounts) {
+    return {
+      ...cfg,
+      channels: {
+        ...channels,
+        [CHANNEL_ID]: {
+          ...channelCfg,
+          appId: "",
+          appSecret: "",
+          token: ""
+        }
+      }
+    };
+  }
+
+  const resolvedId = toStringValue(accountId) || defaultAccountIdFromChannelConfig(channelCfg);
+  const nextAccounts = { ...accounts };
+  delete nextAccounts[resolvedId];
+
+  return {
+    ...cfg,
+    channels: {
+      ...channels,
+      [CHANNEL_ID]: {
+        ...channelCfg,
+        accounts: nextAccounts
+      }
+    }
+  };
+}
+
+async function fetchAccessToken(tokenState, account) {
   const now = Date.now();
-  if (state.accessToken && state.accessTokenExpireAt > now + 30_000) {
-    return state.accessToken;
+  if (tokenState.accessToken && tokenState.accessTokenExpireAt > now + 30_000) {
+    return tokenState.accessToken;
+  }
+
+  if (!account.appId || !account.appSecret) {
+    throw new Error("wemp account missing appId/appSecret");
   }
 
   const url = new URL("https://api.weixin.qq.com/cgi-bin/token");
   url.searchParams.set("grant_type", "client_credential");
-  url.searchParams.set("appid", cfg.appId);
-  url.searchParams.set("secret", cfg.appSecret);
+  url.searchParams.set("appid", account.appId);
+  url.searchParams.set("secret", account.appSecret);
 
   const res = await fetch(url);
   const body = await res.json();
@@ -96,13 +258,16 @@ async function fetchAccessToken(state, cfg) {
   }
 
   const ttlMs = Math.max((body.expires_in ?? 7200) - 120, 300) * 1000;
-  state.accessToken = body.access_token;
-  state.accessTokenExpireAt = now + ttlMs;
-  return state.accessToken;
+  tokenState.accessToken = body.access_token;
+  tokenState.accessTokenExpireAt = now + ttlMs;
+  return tokenState.accessToken;
 }
 
-async function sendWechatText(state, cfg, openId, text) {
-  const accessToken = await fetchAccessToken(state, cfg);
+async function sendWechatText(tokenState, account, openId, text) {
+  if (!openId) throw new Error("wemp sendText missing target openId");
+  if (!text) throw new Error("wemp sendText missing text");
+
+  const accessToken = await fetchAccessToken(tokenState, account);
   const url = new URL("https://api.weixin.qq.com/cgi-bin/message/custom/send");
   url.searchParams.set("access_token", accessToken);
 
@@ -122,128 +287,538 @@ async function sendWechatText(state, cfg, openId, text) {
   }
 }
 
-function readRequestBody(requestLike) {
-  if (!requestLike) return "";
-  if (typeof requestLike.rawBody === "string") return requestLike.rawBody;
-  if (typeof requestLike.body === "string") return requestLike.body;
-  if (typeof requestLike.text === "function") return requestLike.text();
+function toInboundText(payload) {
+  if (payload.msgType === "text") {
+    return toStringValue(payload.content).trim();
+  }
+  if (payload.msgType === "event") {
+    const event = toStringValue(payload.event, "unknown").trim();
+    const key = toStringValue(payload.eventKey).trim();
+    return key ? `[event:${event}] ${key}` : `[event:${event}]`;
+  }
+  return `[${toStringValue(payload.msgType, "unknown").trim() || "unknown"}]`;
+}
+
+function normalizeWechatTarget(raw) {
+  const value = toStringValue(raw).trim();
+  if (!value) return "";
+  return value.replace(/^wechat:(?:user:)?/i, "");
+}
+
+function outboundTextFromPayload(payload) {
+  const text = toStringValue(payload?.text).trim();
+  if (text) return text;
+
+  const mediaUrl = toStringValue(payload?.mediaUrl).trim();
+  if (mediaUrl) return mediaUrl;
+
+  if (Array.isArray(payload?.mediaUrls)) {
+    const lines = payload.mediaUrls
+      .map((item) => toStringValue(item).trim())
+      .filter(Boolean);
+    if (lines.length > 0) return lines.join("\n");
+  }
+
   return "";
 }
 
-function getSendTextPayload(payload) {
-  const p = payload && typeof payload === "object" ? payload : {};
-  const threadId = p.threadId ?? p.chatId ?? p.targetId ?? p.userId;
-  const text = p.text ?? p.message ?? p.content;
-  return {
-    threadId: toStringValue(threadId),
-    text: toStringValue(text)
-  };
+function sendTextResponse(res, statusCode, body) {
+  res.statusCode = statusCode;
+  res.setHeader("content-type", "text/plain; charset=utf-8");
+  res.end(body);
 }
 
-function makeGatewayAdapter(api, state) {
-  return ({ channelConfig, ctx }) => {
-    const cfg = normalizeConfig(channelConfig);
+function sendJsonResponse(res, statusCode, body) {
+  res.statusCode = statusCode;
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(body));
+}
 
-    if (cfg.enabled && typeof ctx?.addRoutes === "function") {
-      const routeHandler = async (routeCtx) => {
-        const request = routeCtx?.request ?? routeCtx?.req ?? routeCtx;
-        const method = toStringValue(request?.method, "GET").toUpperCase();
-        const query = readQuery(request?.query ?? request?.searchParams ?? request?.url);
-        const signature = toStringValue(query.signature);
-        const timestamp = toStringValue(query.timestamp);
-        const nonce = toStringValue(query.nonce);
-        const echostr = toStringValue(query.echostr, "ok");
+function createChannelPlugin(api) {
+  const tokenStateByAccount = new Map();
+  const webhookByAccount = new Map();
 
-        if (cfg.verifySignature) {
-          const ok = verifySignature({ token: cfg.token, signature, timestamp, nonce });
-          if (!ok) return { status: 401, body: "invalid signature" };
-        }
+  const getTokenState = (accountId) => {
+    const key = toStringValue(accountId, DEFAULT_ACCOUNT_ID);
+    const existing = tokenStateByAccount.get(key);
+    if (existing) return existing;
 
-        if (method === "GET") {
-          return { status: 200, body: echostr };
-        }
-        if (method !== "POST") {
-          return { status: 405, body: "method not allowed" };
-        }
+    const created = { accessToken: "", accessTokenExpireAt: 0 };
+    tokenStateByAccount.set(key, created);
+    return created;
+  };
 
-        const rawXml = await readRequestBody(request);
-        const payload = parseXml(toStringValue(rawXml));
-        const fromUser = payload.fromUserName;
-        const msgType = payload.msgType;
-        let text = "";
-        if (msgType === "text") text = payload.content;
-        else if (msgType === "event") text = `[event:${payload.event || "unknown"}] ${payload.eventKey || ""}`.trim();
-        else text = `[${msgType || "unknown"}]`;
+  const stopWebhook = (accountId) => {
+    const key = toStringValue(accountId, DEFAULT_ACCOUNT_ID);
+    const running = webhookByAccount.get(key);
+    if (!running) return;
+    try {
+      running.unregister?.();
+    } catch {}
+    try {
+      running.abortSignal?.removeEventListener?.("abort", running.abortHandler);
+    } catch {}
+    webhookByAccount.delete(key);
+  };
 
-        if (fromUser && text && typeof ctx.onUserText === "function") {
-          await ctx.onUserText({
-            threadId: fromUser,
-            userId: fromUser,
-            text
+  const dispatchInboundText = async ({ cfg, account, fromUser, text, messageId, log }) => {
+    const route = api.runtime.channel.routing.resolveAgentRoute({
+      cfg,
+      channel: CHANNEL_ID,
+      accountId: account.accountId,
+      peer: {
+        kind: "direct",
+        id: fromUser
+      }
+    });
+
+    api.runtime.channel.activity.record({
+      channel: CHANNEL_ID,
+      accountId: route.accountId,
+      direction: "inbound"
+    });
+
+    const timestamp = Date.now();
+    const conversationLabel = `wechat:${fromUser}`;
+    const storePath = api.runtime.channel.session.resolveStorePath(cfg.session?.store, {
+      agentId: route.agentId
+    });
+
+    const envelope = api.runtime.channel.reply.resolveEnvelopeFormatOptions(cfg);
+    const previousTimestamp = api.runtime.channel.session.readSessionUpdatedAt({
+      storePath,
+      sessionKey: route.sessionKey
+    });
+
+    const body = api.runtime.channel.reply.formatInboundEnvelope({
+      channel: "WeChat",
+      from: conversationLabel,
+      timestamp,
+      body: text,
+      chatType: "direct",
+      sender: { id: fromUser },
+      previousTimestamp,
+      envelope
+    });
+
+    const ctxPayload = api.runtime.channel.reply.finalizeInboundContext({
+      Body: body,
+      BodyForAgent: text,
+      RawBody: text,
+      CommandBody: text,
+      From: conversationLabel,
+      To: conversationLabel,
+      SessionKey: route.sessionKey,
+      AccountId: route.accountId,
+      ChatType: "direct",
+      ConversationLabel: conversationLabel,
+      SenderId: fromUser,
+      Provider: CHANNEL_ID,
+      Surface: CHANNEL_ID,
+      MessageSid: messageId,
+      Timestamp: timestamp,
+      OriginatingChannel: CHANNEL_ID,
+      OriginatingTo: conversationLabel
+    });
+
+    await api.runtime.channel.session.updateLastRoute({
+      storePath,
+      sessionKey: route.mainSessionKey ?? route.sessionKey,
+      deliveryContext: {
+        channel: CHANNEL_ID,
+        to: fromUser,
+        accountId: route.accountId
+      },
+      ctx: ctxPayload
+    });
+
+    void api.runtime.channel.session
+      .recordSessionMetaFromInbound({
+        storePath,
+        sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+        ctx: ctxPayload
+      })
+      .catch((err) => {
+        log?.warn?.(`[${account.accountId}] failed to record session meta: ${toSafeErrorText(err)}`);
+      });
+
+    const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
+      cfg,
+      agentId: route.agentId,
+      channel: CHANNEL_ID,
+      accountId: route.accountId
+    });
+
+    const dispatchResult = await api.runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg,
+      dispatcherOptions: {
+        ...prefixOptions,
+        deliver: async (payload) => {
+          const outboundText = outboundTextFromPayload(payload);
+          if (!outboundText) return;
+
+          const tokenState = getTokenState(account.accountId);
+          await sendWechatText(tokenState, account, fromUser, outboundText);
+
+          api.runtime.channel.activity.record({
+            channel: CHANNEL_ID,
+            accountId: route.accountId,
+            direction: "outbound"
           });
-        } else {
-          api.logger?.warn?.("wemp webhook received message but cannot forward to OpenClaw");
+        },
+        onError: (err, info) => {
+          log?.error?.(
+            `[${account.accountId}] dispatch ${info.kind} failed: ${toSafeErrorText(err)}`
+          );
+        }
+      },
+      replyOptions: {
+        onModelSelected
+      }
+    });
+
+    if (!dispatchResult.queuedFinal) {
+      log?.debug?.(`[${account.accountId}] no final reply produced for ${fromUser}`);
+    }
+  };
+
+  const createWebhookHandler = ({ cfg, account, log }) => {
+    return async (req, res) => {
+      const method = toStringValue(req?.method, "GET").toUpperCase();
+      const query = parseUrlQuery(req?.url);
+      const signature = toStringValue(query.signature).trim();
+      const timestamp = toStringValue(query.timestamp).trim();
+      const nonce = toStringValue(query.nonce).trim();
+      const echostr = toStringValue(query.echostr, "ok");
+
+      if (account.verifySignature) {
+        const ok = verifySignature({
+          token: account.token,
+          signature,
+          timestamp,
+          nonce
+        });
+        if (!ok) {
+          sendTextResponse(res, 401, "invalid signature");
+          return;
+        }
+      }
+
+      if (method === "GET") {
+        sendTextResponse(res, 200, echostr);
+        return;
+      }
+
+      if (method !== "POST") {
+        res.statusCode = 405;
+        res.setHeader("allow", "GET, POST");
+        sendTextResponse(res, 405, "method not allowed");
+        return;
+      }
+
+      try {
+        const rawXml = await readRequestBodyWithLimit(req, {
+          maxBytes: WEBHOOK_MAX_BODY_BYTES,
+          timeoutMs: WEBHOOK_BODY_TIMEOUT_MS
+        });
+
+        const payload = parseXml(toStringValue(rawXml));
+        const fromUser = toStringValue(payload.fromUserName).trim();
+        const text = toInboundText(payload);
+        const messageId = toStringValue(payload.msgId, nowMessageId("wemp-inbound"));
+
+        sendTextResponse(res, 200, "success");
+
+        if (!fromUser || !text) {
+          log?.warn?.(`[${account.accountId}] webhook payload missing sender/text`);
+          return;
         }
 
-        return { status: 200, body: "success" };
-      };
+        void dispatchInboundText({
+          cfg,
+          account,
+          fromUser,
+          text,
+          messageId,
+          log
+        }).catch((err) => {
+          log?.error?.(`[${account.accountId}] inbound dispatch failed: ${toSafeErrorText(err)}`);
+        });
+      } catch (err) {
+        if (isRequestBodyLimitError(err, "PAYLOAD_TOO_LARGE")) {
+          sendJsonResponse(res, 413, { error: "Payload too large" });
+          return;
+        }
+        if (isRequestBodyLimitError(err, "REQUEST_BODY_TIMEOUT")) {
+          sendJsonResponse(res, 408, { error: requestBodyErrorToText("REQUEST_BODY_TIMEOUT") });
+          return;
+        }
 
-      ctx.addRoutes([
-        { method: "GET", path: cfg.webhookPath, handler: routeHandler },
-        { method: "POST", path: cfg.webhookPath, handler: routeHandler }
-      ]);
-    }
-
-    return {
-      async sendText(payload) {
-        const { threadId, text } = getSendTextPayload(payload);
-        if (!threadId) throw new Error("wemp sendText missing threadId");
-        if (!text) throw new Error("wemp sendText missing text");
-        await sendWechatText(state, cfg, threadId, text);
+        log?.error?.(`[${account.accountId}] webhook error: ${toSafeErrorText(err)}`);
+        if (!res.headersSent) {
+          sendJsonResponse(res, 500, { error: "Internal server error" });
+        }
       }
     };
   };
-}
 
-const channelPlugin = (api) => ({
-  id: CHANNEL_ID,
-  meta: {
+  return {
     id: CHANNEL_ID,
-    label: "WeChat Official Account",
-    selectionLabel: "WeChat Official Account (Webhook)",
-    docsPath: "/channels/wechat-mp",
-    blurb: "WeChat Official Account webhook channel for OpenClaw.",
-    aliases: ["wechat", "wechat-mp"]
-  },
-  name: "WeChat Official Account",
-  metadata: {
-    name: "WeChat Official Account",
-    version: "0.2.0",
-    description: "OpenClaw channel plugin for WeChat Official Account"
-  },
-  configSchema: {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-      enabled: { type: "boolean", default: true },
-      appId: { type: "string" },
-      appSecret: { type: "string" },
-      token: { type: "string" },
-      verifySignature: { type: "boolean", default: true },
-      webhookPath: { type: "string", default: DEFAULT_WEBHOOK_PATH }
+    meta: {
+      id: CHANNEL_ID,
+      label: "WeChat Official Account",
+      selectionLabel: "WeChat Official Account (Webhook)",
+      docsPath: "/channels/wechat-mp",
+      blurb: "WeChat Official Account webhook channel for OpenClaw.",
+      aliases: ["wechat", "wechat-mp"]
     },
-    required: ["enabled", "appId", "appSecret", "token"]
-  },
-  capabilities: {
-    sendText: true,
-    receiveText: true
-  },
-  createGatewayAdapter: makeGatewayAdapter(api, {
-    accessToken: "",
-    accessTokenExpireAt: 0
-  })
-});
+    capabilities: {
+      chatTypes: ["direct"],
+      media: false,
+      threads: false,
+      nativeCommands: false,
+      blockStreaming: false
+    },
+    config: {
+      listAccountIds: (cfg) => listAccountIdsFromRootConfig(cfg),
+      resolveAccount: (cfg, accountId) => resolveAccountFromRootConfig(cfg, accountId),
+      defaultAccountId: (cfg) => {
+        const channelCfg = pickChannelConfig(cfg);
+        return defaultAccountIdFromChannelConfig(channelCfg);
+      },
+      setAccountEnabled: ({ cfg, accountId, enabled }) =>
+        setAccountEnabledInConfig(cfg, accountId, enabled),
+      deleteAccount: ({ cfg, accountId }) => deleteAccountFromConfig(cfg, accountId),
+      isEnabled: (account) => account.enabled !== false,
+      disabledReason: () => "channel disabled",
+      isConfigured: (account) => isAccountConfigured(account),
+      unconfiguredReason: () => "wemp requires appId + appSecret + token",
+      describeAccount: (account) => ({
+        accountId: account.accountId,
+        name: account.name,
+        enabled: account.enabled,
+        configured: isAccountConfigured(account),
+        webhookPath: account.webhookPath,
+        mode: "webhook"
+      })
+    },
+    outbound: {
+      deliveryMode: "direct",
+      resolveTarget: ({ to }) => {
+        const normalized = normalizeWechatTarget(to);
+        if (!normalized) {
+          return { ok: false, error: new Error("wemp missing target openId") };
+        }
+        return { ok: true, to: normalized };
+      },
+      sendText: async ({ cfg, to, text, accountId }) => {
+        const target = normalizeWechatTarget(to);
+        if (!target) throw new Error("wemp sendText missing target openId");
 
-export default function register(api) {
-  api.registerChannel({ plugin: channelPlugin(api) });
+        const account = resolveAccountFromRootConfig(cfg, accountId);
+        if (!isAccountConfigured(account)) {
+          throw new Error("wemp account not configured (appId/appSecret/token required)");
+        }
+
+        const content = toStringValue(text).trim();
+        if (!content) throw new Error("wemp sendText missing text");
+
+        const tokenState = getTokenState(account.accountId);
+        await sendWechatText(tokenState, account, target, content);
+
+        api.runtime.channel.activity.record({
+          channel: CHANNEL_ID,
+          accountId: account.accountId,
+          direction: "outbound"
+        });
+
+        return {
+          channel: CHANNEL_ID,
+          messageId: nowMessageId("wemp-outbound"),
+          chatId: target,
+          timestamp: Date.now()
+        };
+      },
+      sendMedia: async ({ cfg, to, text, mediaUrl, accountId }) => {
+        const contentLines = [toStringValue(text).trim(), toStringValue(mediaUrl).trim()].filter(Boolean);
+        if (contentLines.length === 0) {
+          throw new Error("wemp sendMedia requires text or mediaUrl");
+        }
+        const target = normalizeWechatTarget(to);
+        if (!target) throw new Error("wemp sendMedia missing target openId");
+
+        const account = resolveAccountFromRootConfig(cfg, accountId);
+        if (!isAccountConfigured(account)) {
+          throw new Error("wemp account not configured (appId/appSecret/token required)");
+        }
+
+        const tokenState = getTokenState(account.accountId);
+        await sendWechatText(tokenState, account, target, contentLines.join("\n"));
+
+        api.runtime.channel.activity.record({
+          channel: CHANNEL_ID,
+          accountId: account.accountId,
+          direction: "outbound"
+        });
+
+        return {
+          channel: CHANNEL_ID,
+          messageId: nowMessageId("wemp-outbound"),
+          chatId: target,
+          timestamp: Date.now(),
+          meta: { degradedMedia: true }
+        };
+      }
+    },
+    status: {
+      defaultRuntime: {
+        accountId: DEFAULT_ACCOUNT_ID,
+        running: false,
+        mode: "webhook",
+        lastStartAt: null,
+        lastStopAt: null,
+        lastError: null
+      },
+      collectStatusIssues: (accounts) => {
+        const issues = [];
+        for (const account of accounts) {
+          const accountId = account.accountId || DEFAULT_ACCOUNT_ID;
+          if (!account.configured) {
+            issues.push({
+              channel: CHANNEL_ID,
+              accountId,
+              kind: "config",
+              message: "wemp requires appId, appSecret, and token"
+            });
+          }
+        }
+        return issues;
+      },
+      buildChannelSummary: ({ snapshot }) => ({
+        configured: snapshot.configured ?? false,
+        running: snapshot.running ?? false,
+        webhookPath: snapshot.webhookPath ?? null,
+        mode: snapshot.mode ?? "webhook",
+        lastError: snapshot.lastError ?? null,
+        lastStartAt: snapshot.lastStartAt ?? null,
+        lastStopAt: snapshot.lastStopAt ?? null,
+        lastInboundAt: snapshot.lastInboundAt ?? null,
+        lastOutboundAt: snapshot.lastOutboundAt ?? null
+      }),
+      buildAccountSnapshot: ({ account, runtime }) => ({
+        accountId: account.accountId,
+        name: account.name,
+        enabled: account.enabled,
+        configured: isAccountConfigured(account),
+        running: runtime?.running ?? false,
+        mode: "webhook",
+        webhookPath: account.webhookPath,
+        lastError: runtime?.lastError ?? null,
+        lastStartAt: runtime?.lastStartAt ?? null,
+        lastStopAt: runtime?.lastStopAt ?? null,
+        lastInboundAt: runtime?.lastInboundAt ?? null,
+        lastOutboundAt: runtime?.lastOutboundAt ?? null
+      })
+    },
+    gateway: {
+      startAccount: async (ctx) => {
+        const account = ctx.account;
+        const accountId = toStringValue(account.accountId, DEFAULT_ACCOUNT_ID);
+        stopWebhook(accountId);
+
+        if (!account.enabled) {
+          ctx.setStatus({
+            ...ctx.getStatus(),
+            running: false,
+            mode: "webhook",
+            lastError: null
+          });
+          return { started: false, reason: "disabled" };
+        }
+
+        if (!isAccountConfigured(account)) {
+          ctx.setStatus({
+            ...ctx.getStatus(),
+            accountId,
+            running: false,
+            mode: "webhook",
+            lastError: "wemp account not configured (appId/appSecret/token required)"
+          });
+          return { started: false, reason: "unconfigured" };
+        }
+
+        const normalizedPath =
+          normalizePluginHttpPath(account.webhookPath, DEFAULT_WEBHOOK_PATH) || DEFAULT_WEBHOOK_PATH;
+
+        const handler = createWebhookHandler({
+          cfg: ctx.cfg,
+          account,
+          log: ctx.log
+        });
+
+        const unregister = registerPluginHttpRoute({
+          path: normalizedPath,
+          pluginId: PLUGIN_ID,
+          accountId,
+          log: (message) => ctx.log?.debug?.(message),
+          handler
+        });
+
+        const abortHandler = () => {
+          stopWebhook(accountId);
+          ctx.setStatus({
+            ...ctx.getStatus(),
+            running: false,
+            mode: "webhook",
+            lastStopAt: Date.now()
+          });
+        };
+
+        ctx.abortSignal?.addEventListener?.("abort", abortHandler);
+
+        webhookByAccount.set(accountId, {
+          unregister,
+          abortSignal: ctx.abortSignal,
+          abortHandler,
+          path: normalizedPath
+        });
+
+        ctx.setStatus({
+          ...ctx.getStatus(),
+          accountId,
+          running: true,
+          mode: "webhook",
+          webhookPath: normalizedPath,
+          lastStartAt: Date.now(),
+          lastError: null
+        });
+
+        ctx.log?.info?.(`[${accountId}] wemp webhook listening on ${normalizedPath}`);
+        return { started: true, webhookPath: normalizedPath };
+      },
+      stopAccount: async (ctx) => {
+        const accountId = toStringValue(ctx.accountId, DEFAULT_ACCOUNT_ID);
+        stopWebhook(accountId);
+        ctx.setStatus({
+          ...ctx.getStatus(),
+          running: false,
+          mode: "webhook",
+          lastStopAt: Date.now()
+        });
+      }
+    }
+  };
 }
+
+const plugin = {
+  id: PLUGIN_ID,
+  name: "WeChat Official Account",
+  description: "OpenClaw channel plugin for WeChat Official Account",
+  configSchema: emptyPluginConfigSchema(),
+  register(api) {
+    api.registerChannel({ plugin: createChannelPlugin(api) });
+  }
+};
+
+export default plugin;
