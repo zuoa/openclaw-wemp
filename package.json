@@ -25,8 +25,8 @@
     ],
     "channel": {
       "id": "wemp",
-      "label": "WeChat Official Account",
-      "selectionLabel": "WeChat Official Account (Webhook)",
+      "label": "wemp (WeChat Official Account)",
+      "selectionLabel": "wemp (WeChat Official Account Webhook)",
       "docsPath": "/channels/wemp",
       "blurb": "Connect WeChat Official Account webhook messages to OpenClaw Gateway.",
       "aliases": [
