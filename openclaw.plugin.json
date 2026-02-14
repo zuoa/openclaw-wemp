@@ -1,0 +1,15 @@
+{
+  "id": "openclaw-plugin-wemp",
+  "name": "OpenClaw WeChat Official Account",
+  "version": "0.2.0",
+  "description": "WeChat Official Account channel plugin for OpenClaw",
+  "main": "index.js",
+  "channels": [
+    "wemp"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {}
+  }
+}

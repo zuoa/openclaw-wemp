@@ -1,0 +1,29 @@
+{
+  "name": "@openclaw/wechat-mp",
+  "version": "0.2.0",
+  "description": "Officially loadable OpenClaw channel plugin for WeChat Official Account",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {},
+  "keywords": [
+    "openclaw",
+    "wechat",
+    "official-account",
+    "gateway-plugin"
+  ],
+  "peerDependencies": {
+    "openclaw": "*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
