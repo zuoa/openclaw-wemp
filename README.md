@@ -2,6 +2,37 @@
 
 用于把微信公众号（服务号/订阅号）接入 OpenClaw Gateway 的渠道插件（官方 `registerChannel` 方式）。
 
+## 插件安装（OpenClaw）
+
+这是 **OpenClaw Gateway 插件**，请安装到你的 OpenClaw Gateway 项目中（不是在公众号后台安装）。
+
+1. 获取插件源码（如果你还没有本地目录）
+
+```bash
+git clone https://github.com/zuoa/openclaw-wemp.git
+```
+
+2. 在 Gateway 环境安装本地插件（开发态推荐 `-l/--link`）
+
+```bash
+openclaw plugins install -l /path/to/openclaw-wemp
+```
+
+3. 重启 Gateway（插件在 Gateway 进程内加载，必须重启）
+
+4. 检查插件状态
+
+```bash
+openclaw plugins list
+openclaw plugins info openclaw-plugin-wemp
+openclaw plugins doctor
+```
+
+5. 在 `~/.openclaw/openclaw.json` 配置 `channels.wemp`
+
+- 下面的 `OpenClaw 配置示例（JSON）` 可直接参考。`channels.wemp` 这种对象结构是正确的。
+
+
 ## 功能
 
 - 微信回调 `GET` 验证（`signature/timestamp/nonce/echostr`）
