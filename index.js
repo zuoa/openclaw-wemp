@@ -207,6 +207,14 @@ function makeGatewayAdapter(api, state) {
 
 const channelPlugin = (api) => ({
   id: CHANNEL_ID,
+  meta: {
+    id: CHANNEL_ID,
+    label: "WeChat Official Account",
+    selectionLabel: "WeChat Official Account (Webhook)",
+    docsPath: "/channels/wechat-mp",
+    blurb: "WeChat Official Account webhook channel for OpenClaw.",
+    aliases: ["wechat", "wechat-mp"]
+  },
   name: "WeChat Official Account",
   metadata: {
     name: "WeChat Official Account",

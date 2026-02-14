@@ -31,6 +31,7 @@ openclaw plugins doctor
 5. 在 `~/.openclaw/openclaw.json` 配置 `channels.wemp`
 
 - 下面的 `OpenClaw 配置示例（JSON）` 可直接参考。`channels.wemp` 这种对象结构是正确的。
+- 如果 `openclaw configure --section channels` 未出现 `wemp`，可直接手工写入 `channels.wemp`（功能不受影响）。
 
 
 ## 功能

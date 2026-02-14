@@ -22,7 +22,23 @@
   "openclaw": {
     "extensions": [
       "./index.js"
-    ]
+    ],
+    "channel": {
+      "id": "wemp",
+      "label": "WeChat Official Account",
+      "selectionLabel": "WeChat Official Account (Webhook)",
+      "docsPath": "/channels/wechat-mp",
+      "blurb": "Connect WeChat Official Account webhook messages to OpenClaw Gateway.",
+      "aliases": [
+        "wechat",
+        "wechat-mp"
+      ]
+    },
+    "install": {
+      "npmSpec": "git+https://github.com/zuoa/openclaw-wemp.git",
+      "localPath": "~/openclaw-wemp",
+      "defaultChoice": "local"
+    }
   },
   "dependencies": {},
   "devDependencies": {}
