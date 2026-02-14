@@ -10,7 +10,7 @@ import {
   requestBodyErrorToText
 } from "openclaw/plugin-sdk";
 
-const PLUGIN_ID = "wechat-mp";
+const PLUGIN_ID = "wemp";
 const CHANNEL_ID = "wemp";
 const DEFAULT_ACCOUNT_ID = "default";
 const DEFAULT_WEBHOOK_PATH = "/wemp";
