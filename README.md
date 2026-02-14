@@ -24,7 +24,7 @@ openclaw plugins install -l /path/to/openclaw-wemp
 
 ```bash
 openclaw plugins list
-openclaw plugins info openclaw-plugin-wemp
+openclaw plugins info wechat-mp
 openclaw plugins doctor
 ```
 
