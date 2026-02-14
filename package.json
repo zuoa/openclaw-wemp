@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/wechat-mp",
+  "name": "@openclaw/wemp",
   "version": "0.2.0",
   "description": "Officially loadable OpenClaw channel plugin for WeChat Official Account",
   "type": "module",
@@ -27,11 +27,11 @@
       "id": "wemp",
       "label": "WeChat Official Account",
       "selectionLabel": "WeChat Official Account (Webhook)",
-      "docsPath": "/channels/wechat-mp",
+      "docsPath": "/channels/wemp",
       "blurb": "Connect WeChat Official Account webhook messages to OpenClaw Gateway.",
       "aliases": [
         "wechat",
-        "wechat-mp"
+        "wemp"
       ]
     },
     "install": {

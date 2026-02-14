@@ -1,4 +1,4 @@
-# @openclaw/wechat-mp
+# @openclaw/wemp
 
 用于把微信公众号（服务号/订阅号）接入 OpenClaw Gateway 的渠道插件（官方 `registerChannel` 方式）。
 
